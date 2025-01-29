@@ -2,12 +2,12 @@ services:
   server:
     image: diffusionpipe
     ports:
-      - $7860:7860
-      - $8888:8888
-      - $6006:6006
+      - 7860:7860
+      - 8888:8888
+      - 6006:6006
     volumes:
         - type: volume
-          source: comfyui_models
+          source: diffusionpipe_models
           target: /workspace/models
         - type: volume
           source: diffusionpipe_outputs
@@ -29,8 +29,8 @@ services:
       context: .
       dockerfile: Dockerfile
 volumes:
-    comfyui_models:
-        name: comfyui_models
+    diffusionpipe_models:
+        name: diffusionpipe_models
     diffusionpipe_configs:
         name: diffusionpipe_configs
     diffusionpipe_outputs:
