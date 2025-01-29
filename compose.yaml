@@ -1,0 +1,39 @@
+services:
+  server:
+    image: diffusionpipe
+    ports:
+      - $7860:7860
+      - $8888:8888
+      - $6006:6006
+    volumes:
+        - type: volume
+          source: comfyui_models
+          target: /workspace/models
+        - type: volume
+          source: diffusionpipe_outputs
+          target: /workspace/outputs
+        - type: volume
+          source: diffusionpipe_configs
+          target: /workspace/configs
+        - type: volume
+          source: diffusionpipe_datasets
+          target: /workspace/datasets
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    build:
+      context: .
+      dockerfile: Dockerfile
+volumes:
+    comfyui_models:
+        name: comfyui_models
+    diffusionpipe_configs:
+        name: diffusionpipe_configs
+    diffusionpipe_outputs:
+        name: diffusionpipe_outputs
+    diffusionpipe_datasets:
+        name: diffusionpipe_datasets
