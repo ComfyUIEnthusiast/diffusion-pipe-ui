@@ -4,6 +4,7 @@ import random
 from collections import defaultdict
 import math
 import os
+import hashlib
 
 import numpy as np
 import torch
@@ -81,7 +82,9 @@ class SizeBucketDataset:
         self.cache_dir = self.path / 'cache' / self.model_name / f'cache_{size_bucket[0]}x{size_bucket[1]}x{size_bucket[2]}'
         os.makedirs(self.cache_dir, exist_ok=True)
         self.text_embedding_datasets = []
-        self.num_repeats = self.directory_config.get('num_repeats', 1)
+        self.num_repeats = self.directory_config['num_repeats']
+        if self.num_repeats <= 0:
+            raise ValueError(f'num_repeats must be >0, was {self.num_repeats}')
 
     def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
         print(f'caching latents: {self.size_bucket}')
@@ -103,6 +106,19 @@ class SizeBucketDataset:
         #     cache_file_name=str(self.cache_dir / 'latents_flattened.arrow')
         # )
 
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+        print(f'caching text embeddings: {self.size_bucket}')
+        te_dataset = _map_and_cache(
+            self.metadata_dataset,
+            map_fn,
+            self.cache_dir,
+            cache_file_prefix=f'text_embeddings_{i}_',
+            new_fingerprint_args=[i],
+            regenerate_cache=regenerate_cache,
+            caching_batch_size=caching_batch_size,
+        )
+        self.text_embedding_datasets.append(te_dataset)
+
     def add_text_embedding_dataset(self, te_dataset):
         self.text_embedding_datasets.append(te_dataset)
 
@@ -118,7 +134,7 @@ class SizeBucketDataset:
         return ret
 
     def __len__(self):
-        return len(self.latent_dataset) * self.num_repeats
+        return int(len(self.latent_dataset) * self.num_repeats)
 
 
 # Logical concatenation of multiple SizeBucketDataset, for the same size bucket. It returns items
@@ -207,23 +223,42 @@ class ARBucketDataset:
 
 
 class DirectoryDataset:
-    def __init__(self, directory_config, dataset_config, model_name, framerate=None):
+    def __init__(self, directory_config, dataset_config, model_name, framerate=None, skip_dataset_validation=False):
         self._set_defaults(directory_config, dataset_config)
         self.directory_config = directory_config
         self.dataset_config = dataset_config
+        if not skip_dataset_validation:
+            self.validate()
         self.model_name = model_name
         self.framerate = framerate
         self.enable_ar_bucket = directory_config.get('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
-        self.resolutions = self._process_user_provided_resolutions(
-            directory_config.get('resolutions', dataset_config['resolutions'])
-        )
+        # Configure directly from user-specified size buckets.
+        self.size_buckets = directory_config.get('size_buckets', dataset_config.get('size_buckets', None))
+        self.use_size_buckets = (self.size_buckets is not None)
+        if self.use_size_buckets:
+            # sort size bucket from longest frame length to shortest
+            self.size_buckets.sort(key=lambda t: t[-1], reverse=True)
+            self.size_buckets = np.array(self.size_buckets)
+        else:
+            self.resolutions = self._process_user_provided_resolutions(
+                directory_config.get('resolutions', dataset_config['resolutions'])
+            )
         self.path = Path(self.directory_config['path'])
+        self.mask_path = Path(self.directory_config['mask_path']) if 'mask_path' in self.directory_config else None
+        # For testing. Default if a mask is missing.
+        self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
         self.cache_dir = self.path / 'cache' / self.model_name
 
         if not self.path.exists() or not self.path.is_dir():
             raise RuntimeError(f'Invalid path: {self.path}')
+        if self.mask_path is not None and (not self.mask_path.exists() or not self.mask_path.is_dir()):
+            raise RuntimeError(f'Invalid mask_path: {self.mask_path}')
+        if self.default_mask_file is not None and (not self.default_mask_file.exists() or not self.default_mask_file.is_file()):
+            raise RuntimeError(f'Invalid default_mask_file: {self.default_mask_file}')
 
-        if not self.enable_ar_bucket:
+        if self.use_size_buckets:
+            self.ars = np.array([w / h for w, h, _ in self.size_buckets])
+        elif not self.enable_ar_bucket:
             self.ars = np.array([1.0])
         elif ars := self.directory_config.get('ar_buckets', self.dataset_config.get('ar_buckets', None)):
             self.ars = self._process_user_provided_ars(ars)
@@ -232,6 +267,7 @@ class DirectoryDataset:
             max_ar = self.directory_config.get('max_ar', self.dataset_config['max_ar'])
             num_ar_buckets = self.directory_config.get('num_ar_buckets', self.dataset_config['num_ar_buckets'])
             self.ars = np.geomspace(min_ar, max_ar, num=num_ar_buckets)
+        self.log_ars = np.log(self.ars)
         frame_buckets = self.directory_config.get('frame_buckets', self.dataset_config.get('frame_buckets', [1]))
         if 1 not in frame_buckets:
             # always have an image bucket for convenience
@@ -239,13 +275,26 @@ class DirectoryDataset:
         frame_buckets.sort()
         self.frame_buckets = np.array(frame_buckets)
 
+    def validate(self):
+        resolutions = self.directory_config.get('resolutions', self.dataset_config.get('resolutions', []))
+        if len(resolutions) > 3:
+            if is_main_process():
+                print('WARNING: You have set a lot of resolutions in the dataset config. Please read the comments in the example dataset.toml file,'
+                      ' and make sure you understand what this setting does. If you still want to proceed with the current configuration,'
+                      ' run the script with the --i_know_what_i_am_doing flag.')
+            quit()
+
     def cache_metadata(self, regenerate_cache=False):
         files = list(self.path.glob('*'))
         # deterministic order
         files.sort()
 
+        # Mask can have any extension, it just needs to have the same stem as the image.
+        mask_file_stems = {path.stem: path for path in self.mask_path.glob('*') if path.is_file()} if self.mask_path is not None else {}
+
         image_files = []
         caption_files = []
+        mask_files = []
         for file in files:
             if not file.is_file() or file.suffix == '.txt' or file.suffix == '.npz':
                 continue
@@ -256,13 +305,22 @@ class DirectoryDataset:
                 caption_file = ''
             image_files.append(str(image_file))
             caption_files.append(str(caption_file))
+            if image_file.stem in mask_file_stems:
+                mask_files.append(str(mask_file_stems[image_file.stem]))
+            elif self.default_mask_file is not None:
+                mask_files.append(str(self.default_mask_file))
+            else:
+                if self.mask_path is not None:
+                    logger.warning(f'No mask file was found for image {image_file}, not using mask.')
+                mask_files.append(None)
         assert len(image_files) > 0, f'Directory {self.path} had no images/videos!'
 
-        metadata_dataset = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files})
-        # Shuffle the data. Use a fixed seed, so the dataset is identical on all processes.
-        # Processes other than rank 0 will then load it from cache.
-        metadata_dataset = metadata_dataset.shuffle(seed=0)
-        metadata_map_fn = self._metadata_map_fn(self.ars, self.frame_buckets)
+        metadata_dataset = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files, 'mask_file': mask_files})
+        # Shuffle the data. Use a deterministic seed, so the dataset is identical on all processes.
+        # Seed is based on the hash of the directory path, so that if directories have the same set of images, they are shuffled differently.
+        seed = int(hashlib.md5(str.encode(str(self.path))).hexdigest(), 16) % int(1e9)
+        metadata_dataset = metadata_dataset.shuffle(seed=seed)
+        metadata_map_fn = self._metadata_map_fn()
         fingerprint = Hasher.hash([metadata_dataset._fingerprint, metadata_map_fn])
         print('caching metadata')
         metadata_dataset = metadata_dataset.map(
@@ -274,34 +332,51 @@ class DirectoryDataset:
             num_proc=NUM_PROC,
             remove_columns=metadata_dataset.column_names,
         )
+
         grouped_metadata = defaultdict(lambda: defaultdict(list))
         for example in metadata_dataset:
-            ar_bucket = example['ar_bucket']
-            ar_bucket = (ar_bucket[0], int(ar_bucket[1]))
-            d = grouped_metadata[ar_bucket]
+            if self.use_size_buckets:
+                grouping_key = tuple(example['size_bucket'])
+            else:
+                grouping_key = example['ar_bucket']
+                grouping_key = (grouping_key[0], int(grouping_key[1]))
+            d = grouped_metadata[grouping_key]
             for k, v in example.items():
                 d[k].append(v)
-        self.ar_buckets = []
-        for ar_bucket, metadata in grouped_metadata.items():
-            metadata = datasets.Dataset.from_dict(metadata)
-            self.ar_buckets.append(
-                ARBucketDataset(
-                    ar_bucket,
-                    self.resolutions,
-                    metadata,
-                    self.directory_config,
-                    self.model_name,
+
+        if self.use_size_buckets:
+            self.size_bucket_datasets = []
+            for size_bucket, metadata in grouped_metadata.items():
+                metadata = datasets.Dataset.from_dict(metadata)
+                self.size_bucket_datasets.append(
+                    SizeBucketDataset(
+                        metadata,
+                        self.directory_config,
+                        size_bucket,
+                        self.model_name,
+                    )
                 )
-            )
+        else:
+            self.ar_bucket_datasets = []
+            for ar_bucket, metadata in grouped_metadata.items():
+                metadata = datasets.Dataset.from_dict(metadata)
+                self.ar_bucket_datasets.append(
+                    ARBucketDataset(
+                        ar_bucket,
+                        self.resolutions,
+                        metadata,
+                        self.directory_config,
+                        self.model_name,
+                    )
+                )
 
     def _set_defaults(self, directory_config, dataset_config):
         directory_config.setdefault('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
-        directory_config.setdefault('resolutions', dataset_config['resolutions'])
         directory_config.setdefault('shuffle_tags', dataset_config.get('shuffle_tags', False))
         directory_config.setdefault('caption_prefix', dataset_config.get('caption_prefix', ''))
+        directory_config.setdefault('num_repeats', dataset_config.get('num_repeats', 1))
 
-    def _metadata_map_fn(self, ars, frame_buckets):
-        log_ars = np.log(ars)
+    def _metadata_map_fn(self):
         def fn(example):
             # batch size always 1
             caption_file = example['caption_file'][0]
@@ -316,7 +391,7 @@ class DirectoryDataset:
                 random.shuffle(tags)
                 caption = ', '.join(tags)
             caption = self.directory_config['caption_prefix'] + caption
-            empty_return = {'image_file': [], 'caption': [], 'ar_bucket': [], 'is_video': []}
+            empty_return = {'image_file': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
 
             image_file = Path(image_file)
             if image_file.suffix == '.webp':
@@ -333,7 +408,8 @@ class DirectoryDataset:
                     # TODO: this is an estimate of frame count. What happens if variable frame rate? Is
                     # it still close enough?
                     meta = imageio.v3.immeta(image_file)
-                    height, width = meta['size']
+                    first_frame = next(imageio.v3.imiter(image_file))
+                    height, width = first_frame.shape[:2]
                     assert self.framerate is not None, "Need model framerate but don't have it. This shouldn't happen. Is the framerate attribute on the model set?"
                     frames = int(self.framerate * meta['duration'])
                 else:
@@ -345,24 +421,64 @@ class DirectoryDataset:
                 return empty_return
             is_video = (frames > 1)
             log_ar = np.log(width / height)
-            # Best AR bucket is the one with the smallest AR difference in log space.
-            i = np.argmin(np.abs(log_ar - log_ars))
-            # find closest frame bucket where the number of frames is greater than or equal to the bucket
-            diffs = frames - frame_buckets
-            positive_diffs = diffs[diffs >= 0]
-            if len(positive_diffs) == 0:
-                # video not long enough to find any valid frame bucket
-                print(f'video with frames={frames} is being skipped because it is too short')
-                return empty_return
-            j = np.argmin(positive_diffs)
-            if is_video and frame_buckets[j] == 1:
-                # don't let video be mapped to the image frame bucket
-                print(f'video with frames={frames} is being skipped because it is too short')
-                return empty_return
-            ar_bucket = (ars[i], frame_buckets[j])
 
-            return {'image_file': [str(image_file)], 'caption': [caption], 'ar_bucket': [ar_bucket], 'is_video': [is_video]}
+            if self.use_size_buckets:
+                size_bucket = self._find_closest_size_bucket(log_ar, frames, is_video)
+                if size_bucket is None:
+                    print(f'video with frames={frames} is being skipped because it is too short')
+                    return empty_return
+                ar_bucket = None
+            else:
+                ar_bucket = self._find_closest_ar_bucket(log_ar, frames, is_video)
+                if ar_bucket is None:
+                    print(f'video with frames={frames} is being skipped because it is too short')
+                    return empty_return
+                size_bucket = None
+
+            return {
+                'image_file': [str(image_file)],
+                'mask_file': [example['mask_file'][0]],
+                'caption': [caption],
+                'ar_bucket': [ar_bucket],
+                'size_bucket': [size_bucket],
+                'is_video': [is_video]
+            }
         return fn
+
+    def _find_closest_ar_bucket(self, log_ar, frames, is_video):
+        # Best AR bucket is the one with the smallest AR difference in log space.
+        i = np.argmin(np.abs(log_ar - self.log_ars))
+        # find closest frame bucket where the number of frames is greater than or equal to the bucket
+        diffs = frames - self.frame_buckets
+        positive_diffs = diffs[diffs >= 0]
+        if len(positive_diffs) == 0:
+            # video not long enough to find any valid frame bucket
+            return None
+        j = np.argmin(positive_diffs)
+        if is_video and self.frame_buckets[j] == 1:
+            # don't let video be mapped to the image frame bucket
+            return None
+        ar_bucket = (self.ars[i], self.frame_buckets[j])
+        return ar_bucket
+
+    def _find_closest_size_bucket(self, log_ar, frames, is_video):
+        # Best AR bucket is the one with the smallest AR difference in log space.
+        ar_diffs = np.abs(log_ar - self.log_ars)
+        candidate_size_buckets = self.size_buckets[np.argsort(ar_diffs, kind='stable')]
+        # Find closest size bucket where the number of frames is greater than or equal to the bucket.
+        # self.size_buckets was already sorted longest -> shortest frame length
+        found = False
+        for size_bucket in candidate_size_buckets:
+            if is_video and size_bucket[-1] == 1:
+                # don't let video be mapped to the image frame bucket
+                continue
+            if frames >= size_bucket[-1]:
+                found = True
+                break
+        if not found:
+            # video not long enough to find any valid frame bucket
+            return None
+        return size_bucket
 
     def _process_user_provided_ars(self, ars):
         ar_buckets = set()
@@ -387,18 +503,23 @@ class DirectoryDataset:
         return result
 
     def get_size_bucket_datasets(self):
+        if self.use_size_buckets:
+            return self.size_bucket_datasets
         result = []
-        for ar_bucket_dataset in self.ar_buckets:
+        for ar_bucket_dataset in self.ar_bucket_datasets:
             result.extend(ar_bucket_dataset.get_size_bucket_datasets())
         return result
 
     def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
         print(f'caching latents: {self.path}')
-        for ds in self.ar_buckets:
+        datasets = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
+        for ds in datasets:
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
-        for ds in self.ar_buckets:
+        print(f'caching text embeddings: {self.path}')
+        datasets = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
+        for ds in datasets:
             ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
 
@@ -406,17 +527,25 @@ class DirectoryDataset:
 # for returning the correct batch for the process's data parallel rank. Calls model.prepare_inputs so the
 # returned tuple of tensors is whatever the model needs.
 class Dataset:
-    def __init__(self, dataset_config, model):
+    def __init__(self, dataset_config, model, skip_dataset_validation=False):
         super().__init__()
         self.dataset_config = dataset_config
         self.model = model
         self.model_name = self.model.name
         self.post_init_called = False
         self.eval_quantile = None
+        if not skip_dataset_validation:
+            self.model.model_specific_dataset_config_validation(self.dataset_config)
 
         self.directory_datasets = []
         for directory_config in dataset_config['directory']:
-            directory_dataset = DirectoryDataset(directory_config, dataset_config, self.model_name, framerate=model.framerate)
+            directory_dataset = DirectoryDataset(
+                directory_config,
+                dataset_config,
+                self.model_name,
+                framerate=model.framerate,
+                skip_dataset_validation=skip_dataset_validation,
+            )
             self.directory_datasets.append(directory_dataset)
 
     def post_init(self, data_parallel_rank, data_parallel_world_size, per_device_batch_size, gradient_accumulation_steps):
@@ -478,10 +607,29 @@ class Dataset:
     def _collate(self, examples):
         ret = {}
         for key, value in examples[0].items():
+            if key == 'mask':
+                continue  # mask is handled specially below
             if torch.is_tensor(value):
                 ret[key] = torch.stack([example[key] for example in examples])
             else:
                 ret[key] = [example[key] for example in examples]
+        # Only some items in the batch might have valid mask.
+        masks = [example['mask'] for example in examples]
+        # See if we have any valid masks. If we do, they should all have the same shape.
+        shape = None
+        for mask in masks:
+            if mask is not None:
+                assert shape is None or mask.shape == shape
+                shape = mask.shape
+        if shape is not None:
+            # At least one item has a mask. Need to make the None masks all 1s.
+            for i, mask in enumerate(masks):
+                if mask is None:
+                    masks[i] = torch.ones(shape, dtype=torch.float16)
+            ret['mask'] = torch.stack(masks)
+        else:
+            # We can leave the batch mask as None and the loss_fn will skip masking entirely.
+            ret['mask'] = None
         return ret
 
     def cache_metadata(self, regenerate_cache=False):
@@ -512,21 +660,22 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
 
     def latents_map_fn(example, indices):
         first_size_bucket = example['size_bucket'][0]
-        tensors = []
+        tensors_and_masks = []
         te_idx = []
-        for idx, path, size_bucket in zip(indices, example['image_file'], example['size_bucket']):
+        for idx, path, mask_path, size_bucket in zip(indices, example['image_file'], example['mask_file'], example['size_bucket']):
             assert size_bucket == first_size_bucket
-            items = preprocess_media_file_fn(path, size_bucket)
-            tensors.extend(items)
+            items = preprocess_media_file_fn(path, mask_path, size_bucket)
+            tensors_and_masks.extend(items)
             te_idx.extend([idx] * len(items))
 
-        if len(tensors) == 0:
-            return {'latents': [], 'te_idx': []}
+        if len(tensors_and_masks) == 0:
+            return {'latents': [], 'mask': [], 'te_idx': []}
 
         caching_batch_size = len(example['image_file'])
         results = defaultdict(list)
-        for i in range(0, len(tensors), caching_batch_size):
-            batched = torch.stack(tensors[i:i+caching_batch_size])
+        for i in range(0, len(tensors_and_masks), caching_batch_size):
+            tensors = [t[0] for t in tensors_and_masks[i:i+caching_batch_size]]
+            batched = torch.stack(tensors)
             parent_conn, child_conn = mp.Pipe(duplex=False)
             queue.put((0, batched, child_conn))
             result = parent_conn.recv()  # dict
@@ -536,6 +685,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         for k, v in results.items():
             results[k] = torch.cat(v)
         results['te_idx'] = te_idx
+        results['mask'] = [t[1] for t in tensors_and_masks]
         return results
 
     for ds in datasets:
@@ -579,7 +729,7 @@ class DatasetManager:
     # further sending it to map() workers via the pickled map function, is broken. It gets through a lot of the caching,
     # but eventually, inevitably, queue.put() will fail with BrokenPipeError. Switching from multiprocessing to multiprocess,
     # which has basically the same API, and everything works perfectly. ¯\_(ツ)_/¯
-    def cache(self):
+    def cache(self, unload_models=True):
         if is_main_process():
             manager = mp.Manager()
             queue = [manager.Queue()]
@@ -613,10 +763,15 @@ class DatasetManager:
                 break
             self._handle_task(task)
 
-        # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
-        # TODO: check if this is actually freeing memory.
-        for model in self.submodels:
-            model.to('meta')
+        if unload_models:
+            # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
+            # TODO: check if this is actually freeing memory.
+            for model in self.submodels:
+                if self.model.name == 'sdxl' and model is self.vae:
+                    # If full fine tuning SDXL, we need to keep the VAE weights around for saving the model.
+                    model.to('cpu')
+                else:
+                    model.to('meta')
 
         dist.barrier()
         if is_main_process():
@@ -654,12 +809,14 @@ class DatasetManager:
 
 
 def split_batch(batch, pieces):
-    example_tuple = batch
-    split_size = example_tuple[0].size(0) // pieces
-    split_examples = zip(*(torch.split(tensor, split_size) for tensor in example_tuple))
-    # Deepspeed works with a tuple of (features, labels), even if we don't provide a loss_fn to PipelineEngine,
-    # and instead compute the loss ourselves in the model. It's okay to just return None for the labels here.
-    return [(ex, None) for ex in split_examples]
+    # Each of features, label is a tuple of tensors.
+    features, label = batch
+    split_size = features[0].size(0) // pieces
+    # The tuples passed to Deepspeed need to only contain tensors. For None (e.g. mask, or optional conditioning), convert to empty tensor.
+    split_features = zip(*(torch.split(tensor, split_size) if tensor is not None else [torch.tensor([])]*pieces for tensor in features))
+    split_label = zip(*(torch.split(tensor, split_size) if tensor is not None else [torch.tensor([])]*pieces for tensor in label))
+    # Deepspeed works with a tuple of (features, labels).
+    return list(zip(split_features, split_label))
 
 
 # Splits an example (feature dict) along the batch dimension into a list of examples.
@@ -681,9 +838,10 @@ def split_batch(batch, pieces):
 # pipeline parallel training. Iterates indefinitely (deepspeed requirement). Keeps track of epoch.
 # Updates epoch as soon as the final batch is returned (notably different from qlora-pipe).
 class PipelineDataLoader:
-    def __init__(self, dataset, gradient_accumulation_steps, model, num_dataloader_workers=2):
+    def __init__(self, dataset, model_engine, gradient_accumulation_steps, model, num_dataloader_workers=2):
         self.model = model
         self.dataset = dataset
+        self.model_engine = model_engine
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.num_dataloader_workers = num_dataloader_workers
         self.iter_called = False
@@ -724,7 +882,7 @@ class PipelineDataLoader:
                 self.recreate_dataloader = False
             self.data = self._pull_batches_from_dataloader()
             self.num_batches_pulled = 0
-            self.next_micro_batch = next(self.data)
+            self.next_micro_batch = None
             self.epoch += 1
         return ret
 
@@ -744,10 +902,30 @@ class PipelineDataLoader:
 
     def _pull_batches_from_dataloader(self):
         for batch in self.dataloader:
-            batch = self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
+            features, label = self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
+            target, mask = label
+            # The target depends on the noise, so we must broadcast it from the first stage to the last.
+            # NOTE: I had to patch the pipeline parallel TrainSchedule so that the LoadMicroBatch commands
+            # would line up on the first and last stage so that this doesn't deadlock.
+            target = self._broadcast_target(target)
+            label = (target, mask)
             self.num_batches_pulled += 1
-            for micro_batch in split_batch(batch, self.gradient_accumulation_steps):
+            for micro_batch in split_batch((features, label), self.gradient_accumulation_steps):
                 yield micro_batch
+
+    def _broadcast_target(self, target):
+        model_engine = self.model_engine
+        if not model_engine.is_pipe_parallel:
+            return target
+
+        assert model_engine.is_first_stage() or model_engine.is_last_stage()
+        grid = model_engine.grid
+
+        src_rank = grid.stage_to_global(0)
+        assert src_rank in grid.pp_group
+        target = target.to('cuda')  # must be on GPU to broadcast
+        dist.broadcast(tensor=target, src=src_rank, group=model_engine.first_last_stage_group)
+        return target
 
     # Only the first and last stages in the pipeline pull from the dataloader. Parts of the code need
     # to know the epoch, so we synchronize the epoch so the processes that don't use the dataloader
