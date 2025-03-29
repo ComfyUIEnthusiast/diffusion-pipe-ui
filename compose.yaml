@@ -1,23 +1,20 @@
 services:
   server:
-    image: diffusionpipe
+    image: diffusion-pipe
+    ipc: host
     ports:
-      - 7860:7860
-      - 8888:8888
-      - 6006:6006
+      - ${JUPYTER_PORT}:8888
     volumes:
         - type: volume
+          source: diffusionpipe_output
+          target: /output
+        - type: volume
           source: diffusionpipe_models
-          target: /workspace/models
+          target: /models
         - type: volume
-          source: diffusionpipe_outputs
-          target: /workspace/outputs
-        - type: volume
-          source: diffusionpipe_configs
-          target: /workspace/configs
-        - type: volume
-          source: diffusionpipe_datasets
-          target: /workspace/datasets
+          source: diffusionpipe_dataset
+          target: /dataset
+        - ./models:/importModels
     deploy:
       resources:
         reservations:
@@ -25,15 +22,16 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    environment:
+     - JUPYTER_PORT=${JUPYTER_PORT}
+     - JUPYTER_TOKEN=${JUPYTER_TOKEN}
     build:
       context: .
       dockerfile: Dockerfile
 volumes:
+    diffusionpipe_output:
+        name: diffusionpipe_output
     diffusionpipe_models:
         name: diffusionpipe_models
-    diffusionpipe_configs:
-        name: diffusionpipe_configs
-    diffusionpipe_outputs:
-        name: diffusionpipe_outputs
-    diffusionpipe_datasets:
-        name: diffusionpipe_datasets
+    diffusionpipe_dataset:
+        name: diffusionpipe_dataset

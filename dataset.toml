@@ -1,0 +1,21 @@
+# Resolution settings.
+# Can adjust this to 1024 for image training, especially on 24gb cards.
+resolutions = [160]
+
+# Aspect ratio bucketing settings
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 7
+
+# Frame buckets images only
+#frame_buckets = [1]
+
+# Mix of images and videos (at 33 and 60 frames long)
+frame_buckets = [1,25,49,73,97,121]
+
+[[directory]]
+# Set this to where your dataset is
+path = '/dataset/titfuck'
+# Reduce as necessary
+num_repeats = 1
